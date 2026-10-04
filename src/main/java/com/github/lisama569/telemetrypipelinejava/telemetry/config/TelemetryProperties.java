@@ -29,6 +29,22 @@ public class TelemetryProperties {
     /** Consecutive recovered windows required to resolve. */
     private int recoverWindows = 2;
 
+    /**
+     * Delay after a window's end before it is finalized and emitted, in
+     * milliseconds. Gives late events a grace period and lets a timer finish
+     * windows even when no new traffic arrives.
+     */
+    private long windowCloseDelayMillis = 10_000;
+
+    /**
+     * How long after a window's end an event may still be merged into that
+     * window, in milliseconds. Must be &lt;= windowCloseDelayMillis.
+     */
+    private long lateToleranceMillis = 2_000;
+
+    /** Interval between scheduled finalization passes, in milliseconds. */
+    private long finalizerIntervalMillis = 1_000;
+
     public long getWindowSizeMillis() {
         return windowSizeMillis;
     }
@@ -83,5 +99,29 @@ public class TelemetryProperties {
 
     public void setRecoverWindows(int recoverWindows) {
         this.recoverWindows = recoverWindows;
+    }
+
+    public long getWindowCloseDelayMillis() {
+        return windowCloseDelayMillis;
+    }
+
+    public void setWindowCloseDelayMillis(long windowCloseDelayMillis) {
+        this.windowCloseDelayMillis = windowCloseDelayMillis;
+    }
+
+    public long getLateToleranceMillis() {
+        return lateToleranceMillis;
+    }
+
+    public void setLateToleranceMillis(long lateToleranceMillis) {
+        this.lateToleranceMillis = lateToleranceMillis;
+    }
+
+    public long getFinalizerIntervalMillis() {
+        return finalizerIntervalMillis;
+    }
+
+    public void setFinalizerIntervalMillis(long finalizerIntervalMillis) {
+        this.finalizerIntervalMillis = finalizerIntervalMillis;
     }
 }

@@ -5,6 +5,7 @@ import com.github.lisama569.telemetrypipelinejava.telemetry.alert.AlertRule;
 import com.github.lisama569.telemetrypipelinejava.telemetry.alert.AlertStore;
 import com.github.lisama569.telemetrypipelinejava.telemetry.metrics.CardinalityLimiter;
 import com.github.lisama569.telemetrypipelinejava.telemetry.metrics.RollingWindowAggregator;
+import com.github.lisama569.telemetrypipelinejava.telemetry.metrics.WindowFinalizer;
 import com.github.lisama569.telemetrypipelinejava.telemetry.pipeline.PipelineErrorRegistry;
 import com.github.lisama569.telemetrypipelinejava.telemetry.pipeline.TelemetryPipeline;
 import com.github.lisama569.telemetrypipelinejava.telemetry.trace.ContextPropagatingExecutor;
@@ -43,7 +44,22 @@ public class TelemetryConfig {
     public RollingWindowAggregator rollingWindowAggregator(TelemetryProperties properties,
             CardinalityLimiter limiter) {
         return new RollingWindowAggregator(properties.getWindowSizeMillis(),
-                properties.getWindowCount(), limiter);
+                properties.getWindowCount(), limiter,
+                properties.getWindowCloseDelayMillis(),
+                properties.getLateToleranceMillis(),
+                new com.github.lisama569.telemetrypipelinejava.telemetry.metrics
+                        .LateEventRegistry(1_000));
+    }
+
+    /**
+     * Timer that finishes windows whose close delay elapsed, so alerting
+     * progresses (fires and recovers) even with no inbound traffic.
+     */
+    @Bean(destroyMethod = "close")
+    public WindowFinalizer windowFinalizer(RollingWindowAggregator aggregator,
+            TelemetryProperties properties) {
+        return new WindowFinalizer(aggregator, properties.getFinalizerIntervalMillis())
+                .start();
     }
 
     @Bean

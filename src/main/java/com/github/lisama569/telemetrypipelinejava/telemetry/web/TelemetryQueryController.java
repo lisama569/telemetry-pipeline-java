@@ -39,8 +39,21 @@ public class TelemetryQueryController {
     public Map<String, Object> metrics() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("activeWindows", aggregator.activeSnapshots(System.currentTimeMillis()));
+        // Closed but not yet due for finalization: "not yet finalized",
+        // distinct from empty completed windows ("no data this period").
+        out.put("pendingCloseWindows", aggregator.pendingCloseSnapshots());
         out.put("completedWindows", aggregator.completedSnapshots());
+        // Finalized windows with zero events: "no data this period".
+        out.put("emptyWindows", aggregator.emptyWindowSnapshots());
+        out.put("emptyWindowsFinalized", aggregator.emptyWindowCount());
+        out.put("windowCloseDelayMillis", aggregator.windowCloseDelayMillis());
+        out.put("lateToleranceMillis", aggregator.lateToleranceMillis());
         out.put("lateEvents", aggregator.lateEventCount());
+        out.put("lateEventsMergedWithinTolerance",
+                aggregator.lateEventRegistry().mergedCount());
+        out.put("lateEventsDroppedBeyondTolerance",
+                aggregator.lateEventRegistry().droppedCount());
+        out.put("lateEventRecords", aggregator.lateEventRegistry().records());
         out.put("listenerErrors", aggregator.listenerErrorCount());
         out.put("activeDimensions", limiter.activeDimensionCount());
         out.put("maxDimensions", limiter.maxDimensions());
