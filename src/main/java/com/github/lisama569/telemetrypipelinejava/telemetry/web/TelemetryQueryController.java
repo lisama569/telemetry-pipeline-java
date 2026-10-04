@@ -39,8 +39,14 @@ public class TelemetryQueryController {
     public Map<String, Object> metrics() {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("activeWindows", aggregator.activeSnapshots(System.currentTimeMillis()));
+        out.put("openWindows", aggregator.openSnapshots());
         out.put("completedWindows", aggregator.completedSnapshots());
         out.put("lateEvents", aggregator.lateEventCount());
+        out.put("lateEventsMerged", aggregator.lateEventRegistry().mergedCount());
+        out.put("lateEventsRejected", aggregator.lateEventRegistry().rejectedCount());
+        out.put("lateEventClassifications", aggregator.lateEventRegistry().records());
+        out.put("lateEventClassificationDrops",
+                aggregator.lateEventRegistry().droppedRecordCount());
         out.put("listenerErrors", aggregator.listenerErrorCount());
         out.put("activeDimensions", limiter.activeDimensionCount());
         out.put("maxDimensions", limiter.maxDimensions());

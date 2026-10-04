@@ -22,7 +22,8 @@ public class PipelineErrorRegistry {
         TRACE_EXTRACTION,
         METRIC_AGGREGATION,
         ALERT_EVALUATION,
-        ASYNC_PROPAGATION
+        ASYNC_PROPAGATION,
+        WINDOW_FINALIZATION
     }
 
     public record PipelineError(Stage stage, String reason, String exceptionType,

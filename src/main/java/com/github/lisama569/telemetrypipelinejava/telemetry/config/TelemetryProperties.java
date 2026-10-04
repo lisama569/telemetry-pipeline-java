@@ -29,6 +29,15 @@ public class TelemetryProperties {
     /** Consecutive recovered windows required to resolve. */
     private int recoverWindows = 2;
 
+    /** Delay after window end before a window is finalized (idle or not). */
+    private long finalizationDelayMillis = 0;
+
+    /** Grace after finalization during which late events still merge. */
+    private long lateGraceMillis = 0;
+
+    /** Interval between scheduled finalization ticks. */
+    private long finalizationIntervalMillis = 1_000;
+
     public long getWindowSizeMillis() {
         return windowSizeMillis;
     }
@@ -83,5 +92,29 @@ public class TelemetryProperties {
 
     public void setRecoverWindows(int recoverWindows) {
         this.recoverWindows = recoverWindows;
+    }
+
+    public long getFinalizationDelayMillis() {
+        return finalizationDelayMillis;
+    }
+
+    public void setFinalizationDelayMillis(long finalizationDelayMillis) {
+        this.finalizationDelayMillis = finalizationDelayMillis;
+    }
+
+    public long getLateGraceMillis() {
+        return lateGraceMillis;
+    }
+
+    public void setLateGraceMillis(long lateGraceMillis) {
+        this.lateGraceMillis = lateGraceMillis;
+    }
+
+    public long getFinalizationIntervalMillis() {
+        return finalizationIntervalMillis;
+    }
+
+    public void setFinalizationIntervalMillis(long finalizationIntervalMillis) {
+        this.finalizationIntervalMillis = finalizationIntervalMillis;
     }
 }

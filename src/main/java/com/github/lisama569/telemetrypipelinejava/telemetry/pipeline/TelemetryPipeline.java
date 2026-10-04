@@ -8,7 +8,10 @@ import java.util.List;
 
 /**
  * Orchestrates metric recording and alert evaluation for completed requests.
- * Every stage is fault-isolated: internal failures are registered in
+ * Alert evaluation runs on the aggregator's closed-window stream, which is
+ * released in canonical (windowStart, dimension) order, so alert states and
+ * transitions are independent of event arrival order and scheduling. Every
+ * stage is fault-isolated: internal failures are registered in
  * {@link PipelineErrorRegistry} with a distinguishable stage and never
  * propagate to the business request path.
  */
@@ -23,7 +26,7 @@ public class TelemetryPipeline {
         this.aggregator = aggregator;
         this.evaluators = List.copyOf(evaluators);
         this.errorRegistry = errorRegistry;
-        this.aggregator.addWindowListener(this::onWindowCompleted);
+        this.aggregator.addCloseListener(this::onWindowClosed);
     }
 
     /** Records one finished request. Never throws. */
@@ -42,7 +45,7 @@ public class TelemetryPipeline {
         }
     }
 
-    private void onWindowCompleted(WindowSnapshot snapshot) {
+    private void onWindowClosed(WindowSnapshot snapshot) {
         for (AlertEvaluator evaluator : evaluators) {
             try {
                 evaluator.evaluate(snapshot);
