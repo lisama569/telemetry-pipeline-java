@@ -5,7 +5,7 @@
 ## 快速开始
 
 ```bash
-mvn test                 # 运行全部测试（30 个）
+mvn test                 # 运行全部测试（34 个）
 mvn spring-boot:run      # 本地启动（默认 8080 端口）
 ```
 
@@ -48,13 +48,27 @@ curl -s http://localhost:8080/telemetry/errors
 - 窗口生命周期为三态：`ACTIVE → OPEN（已收尾、容错期内可合并）→ CLOSED（不可变、进入告警）`。
 - 窗口切换：新窗口事件到达时，所有更旧的非空桶先快照并**恰好一次**发射给监听器，再复位复用——并发写入与窗口切换下不丢失、可重复。
 - 监听器异常计入 `listenerErrors`，不影响聚合与其他监听器。
-- 查询：`GET /telemetry/metrics` 返回活动窗口（`activeWindows`，还没轮到收尾）、容错期内的已收尾窗口（`openWindows`）、已关闭窗口（`completedWindows`，有界保留 1000 条）、迟到事件分类记录与基数状态。
+- 查询：`GET /telemetry/metrics` 把窗口按生命周期分成互不重叠的分组（见下），另有迟到事件分类记录与基数状态。
 
-### 定时收尾（空流量也能完成窗口）
+### 空流量下的定时收尾、三种窗口状态与空窗口容量边界
 
-- `WindowFinalizationScheduler` 按 `telemetry.finalization-interval-millis`（默认 1000ms）周期性驱动 `finalizeDue`：凡是`窗口结束时间 + telemetry.finalization-delay-millis ≤ 当前时间`的窗口都会被收尾，**不需要新请求进来**。
-- 流量中断期间的空窗口会被合成为 `requestCount=0` 的空窗口并照常进入告警评估——该触发就触发、该恢复就恢复，不会卡在半路。空窗口合成有界（每个维度每次最多 `window-count` 个，更老的空档直接跳过）。
-- 本地查询可区分两种“没数据”：`activeWindows`/`openWindows` 里是**还没轮到收尾**的窗口；`completedWindows` 里 `requestCount=0` 的是**这段时间确实没数据**的已收尾空窗口。
+- `WindowFinalizationScheduler` 按 `telemetry.finalization-interval-millis`（默认 1000ms）周期性驱动 `finalizeDue`：凡是 `窗口结束时间 + telemetry.finalization-delay-millis ≤ 当前时间` 的窗口都会被收尾，**不需要新请求进来**。
+- 本地查询一眼可分三种状态，互不混在一个列表里：
+
+  | 查询分组 | 含义 |
+  |---|---|
+  | `activeWindows` | **进行中**：窗口时间还没走完（当前时间所在窗口） |
+  | `pendingWindows` | **已到点、还没轮到收尾**：窗口时间已走完，但还没到 `结束+收尾延迟`（含同期空档的空占位，`requestCount=0`） |
+  | `emptyWindows` | **那段时间确实没数据且已收尾**：独立保留的已关闭空窗口（`requestCount=0`） |
+
+  另有 `openWindows`（已收尾、容错期内还可合并迟到事件）与 `completedWindows`（只放**有数据**的已关闭真实窗口）。“确实没数据”（`emptyWindows`）与“还没轮到收尾”（`pendingWindows`）因此可以明确分开看出来。
+- **空窗口不能把真实窗口顶出去**：关闭释放时按 `requestCount` 分流，真实窗口进 `completedWindows`（有界 1000 条），空窗口进独立的 `EmptyWindowRegistry`（`emptyWindows`，有界 1000 条，与真实窗口互不挤占）。所以请求停下来、静置多久之后再查，之前真实记录到的窗口（计数、错误水平等）都还查得到。
+- **空窗口独立计数、容量边界可见、不无声丢弃**：
+  - `emptyWindowsTotal`：自启动以来收尾出的空窗口总数，**精确不丢**（静置再久也准确）；
+  - `emptyWindowsEvicted`：独立保留区装满后被淘汰的空窗口数（老的先淘汰，边界可见）；
+  - `emptyWindowsSkippedGaps`：墙上时间发生大跨度跳跃（如机器长时间挂起）时，老于“每次最多合成 `window-count` 个”范围而被整段跳过的空窗口数——这些窗口不逐个合成，但计数精确，`retained + evicted + skipped = total` 永远对得上；
+  - `emptyWindowsCapacity` / `completedWindowsCapacity`：两个保留区各自的容量；`completedWindowsEvicted`：真实窗口的淘汰计数（正常情况下为 0）。
+- 空窗口照常进入告警评估——该触发就触发、该恢复就恢复，不会卡在半路。
 
 ### 迟到与乱序事件
 
@@ -110,10 +124,15 @@ FIRING --(连续 M 窗 ≤ recover)--> RECOVERING --(再连续达标)--> OK
 
 ## 兼容范围与本地验证
 
-- 本次新增完全向后兼容：`finalization-delay-millis` / `late-grace-millis` 默认为 0，此时行为与旧版一致（轮换即收尾即评估）；原有 23 个测试全部保留并通过。
+- 本次改动完全向后兼容：`finalization-delay-millis` / `late-grace-millis` 默认为 0，此时行为与旧版一致（轮换即收尾即评估）；`completedSnapshots()` 等既有方法签名保留（语义收窄为“只含真实窗口”），原有用例全部保留并通过。
 - 本地验证：
-  - `mvn test` 跑全部 30 个测试（含新增的定时收尾、迟到合并/拒绝、告警确定性用例）。
-  - `mvn spring-boot:run` 后调整 `telemetry.finalization-interval-millis` 等配置，打几个请求再静置，观察 `GET /telemetry/metrics` 中窗口从 `activeWindows` → `openWindows` → `completedWindows` 的流转，以及 `GET /telemetry/alerts` 在空流量下的自动恢复。
+  - `mvn test` 跑全部 34 个测试（含新增的静置保留/空窗口计数/三态区分/保留确定性用例）。
+  - `mvn spring-boot:run` 后打几个请求再**长时间静置**（默认 1s 一个收尾 tick），反复 `curl -s http://localhost:8080/telemetry/metrics | python3 -m json.tool`，观察：
+    - `completedWindows` 里的真实窗口随时间一直查得到，不会被空窗口顶掉；
+    - `emptyWindows` 独立列出已收尾空窗口，`emptyWindowsTotal` 精确增长、`emptyWindowsEvicted` 在超过 1000 后可见增长，`completedWindowsEvicted` 始终为 0；
+    - 静置过程中窗口在 `activeWindows`（进行中）→ `pendingWindows`（已到点未收尾，仅在配了 `finalization-delay-millis` 时能看到）→ `emptyWindows`/`completedWindows`（已收尾）之间流转，三组互不重叠；
+    - `GET /telemetry/alerts` 在空流量下仍能自动触发/恢复。
+  - 想快速看到容量边界，可临时把空窗口保留容量调小（构造 `new EmptyWindowRegistry(10)`，见 `IdleRetentionTest`）或模拟墙上时间大跳；用单测中的显式时间戳也能直接驱动 `finalizeDue` 观察 `emptyWindowsSkippedGaps`。
   - 用带旧时间戳的请求（或单测中的显式时间戳）可观察 `lateEventClassifications` 中的 MERGED/REJECTED 记录。
 
 ## 测试
@@ -128,6 +147,8 @@ FIRING --(连续 M 窗 ≤ recover)--> RECOVERING --(再连续达标)--> OK
 - `ScheduledFinalizationTest` — 空流量下定时收尾驱动告警触发与恢复、收尾延迟可配、空窗口与未收尾窗口可区分
 - `LateEventHandlingTest` — 容错期内迟到事件合并（恰好一次、可查询）、超限拒绝与有界分类记录、并发合并不重不丢
 - `AlertDeterminismTest` — 同一批数据在顺序/打乱/并发三种到达方式下告警状态与迁移序列完全一致
+- `IdleRetentionTest` — 长时间静置下真实窗口不被空窗口挤掉、空窗口独立保留与精确计数（含淘汰边界与大跳空档计数）、进行中/待收尾/已收尾空窗口三态可区分
+- `RetentionDeterminismTest` — 同一批含空档与稀疏维度的数据在顺序/打乱/并发三种到达方式下，真实窗口保留、空窗口列表与计数、告警结果完全一致
 - `PipelineFaultIsolationTest` / `WebLayerFaultIsolationTest` — 监听器与告警评估故障的隔离、分类与业务无感
 
 ## 代码结构
@@ -137,7 +158,7 @@ telemetry/
   trace/     TraceContext, TraceContextHolder, TraceHeaderParser,
              TraceContextFilter, ContextPropagatingExecutor, TraceIssueRegistry
   metrics/   DimensionKey, WindowSnapshot, CardinalityLimiter, RollingWindowAggregator,
-             LateEventRegistry
+             EmptyWindowRegistry, LateEventRegistry
   alert/     AlertState, AlertRule, AlertEvaluator, AlertStore
   pipeline/  TelemetryPipeline, PipelineErrorRegistry, WindowFinalizationScheduler
   config/    TelemetryProperties, TelemetryConfig

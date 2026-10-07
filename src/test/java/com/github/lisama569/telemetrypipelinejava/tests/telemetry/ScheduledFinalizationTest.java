@@ -60,13 +60,18 @@ class ScheduledFinalizationTest {
         aggregator.record(DIM, 10, true, 300);
         aggregator.record(DIM, 10, false, 400);
 
-        log.info("intermediate: before any tick active={} completed={} state={}",
-                aggregator.activeSnapshots(500), aggregator.completedSnapshots(),
-                evaluator.state());
+        log.info("intermediate: before any tick active={} pending={} completed={}"
+                + " empty={} state={}", aggregator.activeSnapshots(500),
+                aggregator.pendingSnapshots(500), aggregator.completedSnapshots(),
+                aggregator.emptyWindowSnapshots(), evaluator.state());
         assertThat(aggregator.activeSnapshots(500))
-                .as("window 0 not yet finalized: still active").hasSize(1);
+                .as("window 0 not elapsed yet: still active").hasSize(1);
+        assertThat(aggregator.pendingSnapshots(500))
+                .as("window 0 not elapsed yet: nothing pending").isEmpty();
         assertThat(aggregator.completedSnapshots())
                 .as("window 0 not yet finalized: nothing closed").isEmpty();
+        assertThat(aggregator.emptyWindowSnapshots())
+                .as("window 0 not yet finalized: no finalized empty window").isEmpty();
         assertThat(evaluator.state())
                 .as("no evaluation happens before finalization").isEqualTo(AlertState.OK);
 
@@ -94,15 +99,27 @@ class ScheduledFinalizationTest {
                 .containsExactly(AlertState.FIRING, AlertState.RECOVERING, AlertState.OK);
 
         List<WindowSnapshot> completed = aggregator.completedSnapshots();
-        log.info("verdict: completed={} active={}", completed,
-                aggregator.activeSnapshots(3_000));
+        List<WindowSnapshot> emptyWindows = aggregator.emptyWindowSnapshots();
+        log.info("verdict: completed(real)={} empty={} active={} pending={}",
+                completed, emptyWindows, aggregator.activeSnapshots(3_000),
+                aggregator.pendingSnapshots(3_000));
         assertThat(completed)
-                .as("windows 0,1,2 all closed by the scheduler").hasSize(3);
-        assertThat(completed.stream().filter(s -> s.requestCount() == 0).count())
-                .as("idle periods appear as explicit empty windows (count=0)")
-                .isEqualTo(2);
+                .as("only the real window 0 is in the real-window retention").hasSize(1);
+        assertThat(completed.get(0).requestCount())
+                .as("the window with traffic survives and stays queryable").isEqualTo(4);
+        assertThat(emptyWindows)
+                .as("idle periods are finalized into the independent empty retention")
+                .hasSize(2);
+        assertThat(emptyWindows)
+                .as("finalized empty windows explicitly carry requestCount=0")
+                .allSatisfy(s -> assertThat(s.requestCount()).isZero());
+        assertThat(aggregator.emptyWindowRegistry().totalEmptyWindowCount())
+                .as("empty-window counter is exact").isEqualTo(2);
         assertThat(aggregator.activeSnapshots(3_000))
-                .as("nothing left unfinalized").isEmpty();
+                .as("nothing in progress at the elapsed timestamp").isEmpty();
+        assertThat(aggregator.pendingSnapshots(3_000))
+                .as("window 3 elapsed at t=3000 but is finalized in the same tick")
+                .isEmpty();
         assertThat(errors.errors()).as("no pipeline errors").isEmpty();
     }
 
@@ -122,21 +139,32 @@ class ScheduledFinalizationTest {
         aggregator.record(DIM, 10, true, 100);
 
         scheduler.tick(1_499); // window end (1000) + delay (500) not reached
-        log.info("intermediate: tick(1499) active={} completed={} state={}",
-                aggregator.activeSnapshots(1_499), aggregator.completedSnapshots(),
-                evaluator.state());
+        log.info("intermediate: tick(1499) active={} pending={} completed={}"
+                + " empty={} state={}", aggregator.activeSnapshots(1_499),
+                aggregator.pendingSnapshots(1_499), aggregator.completedSnapshots(),
+                aggregator.emptyWindowSnapshots(), evaluator.state());
         assertThat(aggregator.activeSnapshots(1_499))
-                .as("before end+delay the window is pending, not finalized").hasSize(1);
+                .as("window 0 has elapsed: no longer active").isEmpty();
+        assertThat(aggregator.pendingSnapshots(1_499))
+                .as("elapsed but end+delay not reached: due, waiting its turn")
+                .hasSize(1);
+        assertThat(aggregator.pendingSnapshots(1_499).get(0).requestCount())
+                .as("the pending entry is the real window holding its event").isEqualTo(1);
         assertThat(aggregator.completedSnapshots())
                 .as("before end+delay nothing is closed").isEmpty();
+        assertThat(aggregator.emptyWindowSnapshots())
+                .as("before end+delay nothing is finalized as empty").isEmpty();
         assertThat(evaluator.state()).as("no premature evaluation")
                 .isEqualTo(AlertState.OK);
 
         scheduler.tick(1_500); // end + delay reached
-        log.info("verdict: tick(1500) completed={} state={}",
-                aggregator.completedSnapshots(), evaluator.state());
+        log.info("verdict: tick(1500) completed(real)={} empty={} state={}",
+                aggregator.completedSnapshots(), aggregator.emptyWindowSnapshots(),
+                evaluator.state());
         assertThat(aggregator.completedSnapshots())
-                .as("window finalized exactly at end+delay").hasSize(1);
+                .as("real window finalized exactly at end+delay").hasSize(1);
+        assertThat(aggregator.emptyWindowSnapshots())
+                .as("no idle gap exists yet, so no finalized empty window").isEmpty();
         assertThat(evaluator.state())
                 .as("breaching window fires right after the configured delay")
                 .isEqualTo(AlertState.FIRING);

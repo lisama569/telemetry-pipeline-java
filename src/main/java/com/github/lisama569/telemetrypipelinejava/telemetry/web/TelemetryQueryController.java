@@ -37,10 +37,20 @@ public class TelemetryQueryController {
 
     @GetMapping("/metrics")
     public Map<String, Object> metrics() {
+        long now = System.currentTimeMillis();
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("activeWindows", aggregator.activeSnapshots(System.currentTimeMillis()));
+        out.put("activeWindows", aggregator.activeSnapshots(now));
+        out.put("pendingWindows", aggregator.pendingSnapshots(now));
         out.put("openWindows", aggregator.openSnapshots());
         out.put("completedWindows", aggregator.completedSnapshots());
+        out.put("emptyWindows", aggregator.emptyWindowSnapshots());
+        out.put("completedWindowsCapacity", aggregator.completedRetentionBound());
+        out.put("completedWindowsEvicted", aggregator.completedWindowEvictedCount());
+        out.put("emptyWindowsCapacity", aggregator.emptyWindowRegistry().maxRetained());
+        out.put("emptyWindowsTotal", aggregator.emptyWindowRegistry().totalEmptyWindowCount());
+        out.put("emptyWindowsEvicted", aggregator.emptyWindowRegistry().evictedWindowCount());
+        out.put("emptyWindowsSkippedGaps",
+                aggregator.emptyWindowRegistry().skippedGapCount());
         out.put("lateEvents", aggregator.lateEventCount());
         out.put("lateEventsMerged", aggregator.lateEventRegistry().mergedCount());
         out.put("lateEventsRejected", aggregator.lateEventRegistry().rejectedCount());

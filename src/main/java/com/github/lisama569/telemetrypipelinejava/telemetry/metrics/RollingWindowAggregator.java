@@ -36,8 +36,25 @@ import java.util.function.Consumer;
  * <p>Closed windows are released in canonical (windowStart, dimension) order
  * via a watermark: a closed window is released only when every known
  * dimension has closed all older windows, so the stream seen by close
- * listeners is independent of arrival order and thread scheduling. Events
- * too old for any retained or grace-open window are counted in
+ * listeners is independent of arrival order and thread scheduling.
+ *
+ * <p>On release, real windows (requestCount &gt; 0) go into the bounded
+ * completed retention while empty windows go into an independent
+ * {@link EmptyWindowRegistry}: an arbitrarily long idle period can therefore
+ * never evict a window that actually held data. Both retentions are bounded
+ * and count their evictions; large idle jumps that skip empty synthesis
+ * wholesale are counted exactly instead of being lost.
+ *
+ * <p>Local queries distinguish the three non-overlapping in-progress states:
+ * {@link #activeSnapshots(long)} (window time not elapsed),
+ * {@link #pendingSnapshots(long)} (elapsed, not yet finalized — due and
+ * waiting its turn, including bounded empty placeholders) and
+ * {@link #emptyWindowSnapshots()} (that time interval really had no data and
+ * is already finalized/closed), plus the grace-open
+ * ({@link #openSnapshots()}) and real closed ({@link #completedSnapshots()})
+ * sets.
+ *
+ * <p>Events too old for any retained or grace-open window are counted in
  * {@link #lateEventCount()} and audited as rejected instead of being silently
  * dropped. Listener failures are counted in {@link #listenerErrorCount()} and
  * never propagate.
@@ -52,6 +69,7 @@ public class RollingWindowAggregator {
     private final long finalizationDelayMillis;
     private final long lateGraceMillis;
     private final LateEventRegistry lateEventRegistry;
+    private final EmptyWindowRegistry emptyWindowRegistry;
     private final ConcurrentHashMap<DimensionKey, DimensionWindows> windows =
             new ConcurrentHashMap<>();
     private final List<Consumer<WindowSnapshot>> listeners = new CopyOnWriteArrayList<>();
@@ -61,6 +79,9 @@ public class RollingWindowAggregator {
     private final LongAdder lateEvents = new LongAdder();
     private final LongAdder listenerErrors = new LongAdder();
 
+    /** Real windows evicted from the bounded completed retention. */
+    private final LongAdder completedEvicted = new LongAdder();
+
     /** Closed windows waiting for the release watermark; guarded by releaseLock. */
     private final Object releaseLock = new Object();
     private final TreeMap<Long, List<WindowSnapshot>> releaseBuffer = new TreeMap<>();
@@ -68,12 +89,21 @@ public class RollingWindowAggregator {
 
     public RollingWindowAggregator(long windowSizeMillis, int windowCount,
             CardinalityLimiter limiter) {
-        this(windowSizeMillis, windowCount, limiter, 0, 0, new LateEventRegistry());
+        this(windowSizeMillis, windowCount, limiter, 0, 0, new LateEventRegistry(),
+                new EmptyWindowRegistry());
     }
 
     public RollingWindowAggregator(long windowSizeMillis, int windowCount,
             CardinalityLimiter limiter, long finalizationDelayMillis,
             long lateGraceMillis, LateEventRegistry lateEventRegistry) {
+        this(windowSizeMillis, windowCount, limiter, finalizationDelayMillis,
+                lateGraceMillis, lateEventRegistry, new EmptyWindowRegistry());
+    }
+
+    public RollingWindowAggregator(long windowSizeMillis, int windowCount,
+            CardinalityLimiter limiter, long finalizationDelayMillis,
+            long lateGraceMillis, LateEventRegistry lateEventRegistry,
+            EmptyWindowRegistry emptyWindowRegistry) {
         if (windowSizeMillis <= 0 || windowCount <= 0) {
             throw new IllegalArgumentException("windowSizeMillis and windowCount must be > 0");
         }
@@ -86,6 +116,7 @@ public class RollingWindowAggregator {
         this.finalizationDelayMillis = finalizationDelayMillis;
         this.lateGraceMillis = lateGraceMillis;
         this.lateEventRegistry = lateEventRegistry;
+        this.emptyWindowRegistry = emptyWindowRegistry;
     }
 
     /** Records one request event. Never throws. */
@@ -124,11 +155,34 @@ public class RollingWindowAggregator {
         closeListeners.add(listener);
     }
 
-    /** Snapshots of currently active (in-progress, non-empty) windows. */
+    /**
+     * Snapshots of windows still in progress as of {@code nowEpochMillis}
+     * (window start &gt; now, i.e. the current or a future-dated window). A
+     * window whose time has already elapsed is never listed here; see
+     * {@link #pendingSnapshots(long)}.
+     */
     public List<WindowSnapshot> activeSnapshots(long nowEpochMillis) {
+        long nowIndex = Math.floorDiv(nowEpochMillis, windowSizeMillis);
         List<WindowSnapshot> out = new ArrayList<>();
         for (DimensionWindows dw : windows.values()) {
-            dw.collectActive(out);
+            dw.collectActive(nowIndex, out);
+        }
+        return List.copyOf(out);
+    }
+
+    /**
+     * Snapshots of windows whose time has elapsed but which have not been
+     * finalized yet ("due, waiting their turn"): they are either real buckets
+     * the scheduler has not finalized, or bounded empty placeholders
+     * (requestCount=0) for idle gaps inside the pending horizon. A pending
+     * empty placeholder is explicitly distinct from a finalized empty window
+     * in {@link #emptyWindowSnapshots()}.
+     */
+    public List<WindowSnapshot> pendingSnapshots(long nowEpochMillis) {
+        long nowIndex = Math.floorDiv(nowEpochMillis, windowSizeMillis);
+        List<WindowSnapshot> out = new ArrayList<>();
+        for (DimensionWindows dw : windows.values()) {
+            dw.collectPending(nowIndex, out);
         }
         return List.copyOf(out);
     }
@@ -142,9 +196,33 @@ public class RollingWindowAggregator {
         return List.copyOf(out);
     }
 
-    /** Snapshots of closed windows, in release order (bounded retention). */
+    /**
+     * Closed real windows (requestCount &gt; 0), in release order with bounded
+     * retention. Empty windows are never kept here, so idle periods cannot
+     * evict windows that held data; see {@link #emptyWindowSnapshots()}.
+     */
     public List<WindowSnapshot> completedSnapshots() {
         return List.copyOf(completed);
+    }
+
+    /** Closed empty ("no data") windows, kept in an independent bounded retention. */
+    public List<WindowSnapshot> emptyWindowSnapshots() {
+        return emptyWindowRegistry.snapshots();
+    }
+
+    /** Independent empty-window retention with exact counters and eviction signal. */
+    public EmptyWindowRegistry emptyWindowRegistry() {
+        return emptyWindowRegistry;
+    }
+
+    /** Real windows evicted from the bounded completed retention. */
+    public long completedWindowEvictedCount() {
+        return completedEvicted.sum();
+    }
+
+    /** Capacity bound for retained real closed windows. */
+    public int completedRetentionBound() {
+        return MAX_COMPLETED_RETAINED;
     }
 
     /** Events that arrived too late for any retained or grace-open window. */
@@ -173,9 +251,17 @@ public class RollingWindowAggregator {
     }
 
     private void emitClosed(WindowSnapshot snapshot) {
-        completed.addLast(snapshot);
-        while (completed.size() > MAX_COMPLETED_RETAINED) {
-            completed.pollFirst();
+        if (snapshot.requestCount() == 0) {
+            // Empty windows have their own bounded retention: they can never
+            // push a window that held data out of the real retention.
+            emptyWindowRegistry.record(snapshot);
+        } else {
+            completed.addLast(snapshot);
+            while (completed.size() > MAX_COMPLETED_RETAINED) {
+                if (completed.pollFirst() != null) {
+                    completedEvicted.increment();
+                }
+            }
         }
         for (Consumer<WindowSnapshot> listener : closeListeners) {
             try {
@@ -375,8 +461,10 @@ public class RollingWindowAggregator {
             if (nextFinalizeIndex != Long.MIN_VALUE && nextFinalizeIndex <= maxIndex) {
                 // Empty-window synthesis is bounded to the most recent
                 // windowCount indices; older idle gaps are skipped, never
-                // emitted one by one.
+                // emitted one by one — but counted exactly so empty-window
+                // totals and the capacity boundary stay observable.
                 long emptyFloor = maxIndex - windowCount + 1;
+                long skipped = 0;
                 for (long idx = nextFinalizeIndex; idx <= maxIndex; idx++) {
                     if (finalized.contains(idx)) {
                         continue; // finalized before a frontier pull-back
@@ -388,7 +476,12 @@ public class RollingWindowAggregator {
                         b.reset(Long.MIN_VALUE);
                     } else if (idx >= emptyFloor) {
                         finalizeWindow(idx, 0, 0, 0, 0);
+                    } else {
+                        skipped++;
                     }
+                }
+                if (skipped > 0) {
+                    emptyWindowRegistry.addSkippedGap(skipped);
                 }
                 nextFinalizeIndex = maxIndex + 1;
             }
@@ -421,14 +514,46 @@ public class RollingWindowAggregator {
             }
         }
 
-        synchronized void collectActive(List<WindowSnapshot> out) {
+        synchronized void collectActive(long nowIndex, List<WindowSnapshot> out) {
             for (Bucket b : buckets) {
-                if (b.windowIndex != Long.MIN_VALUE && b.count > 0) {
-                    out.add(new WindowSnapshot(dimension, b.windowIndex * windowSizeMillis,
-                            windowSizeMillis, b.count, b.errors, b.totalLatency,
-                            b.maxLatency));
+                if (b.windowIndex != Long.MIN_VALUE && b.windowIndex >= nowIndex) {
+                    out.add(snapshotOfBucket(b));
                 }
             }
+        }
+
+        /**
+         * Elapsed-but-not-finalized windows: real buckets the scheduler has not
+         * finalized yet, plus bounded empty placeholders for the recent idle
+         * gap. Finalized windows (grace-open) and windows older than the
+         * pending horizon are deliberately excluded, so the three query views
+         * never overlap.
+         */
+        synchronized void collectPending(long nowIndex, List<WindowSnapshot> out) {
+            for (Bucket b : buckets) {
+                if (b.windowIndex != Long.MIN_VALUE && b.windowIndex < nowIndex) {
+                    out.add(snapshotOfBucket(b));
+                }
+            }
+            if (maxSeenIndex == Long.MIN_VALUE) {
+                return;
+            }
+            long floor = Math.max(nowIndex - windowCount + 1, nextFinalizeIndex);
+            for (long idx = floor; idx < nowIndex; idx++) {
+                Bucket b = buckets[(int) Math.floorMod(idx, buckets.length)];
+                if (b.windowIndex == idx || open.containsKey(idx)
+                        || finalized.contains(idx)) {
+                    continue; // real pending bucket or already finalized
+                }
+                out.add(new WindowSnapshot(dimension, idx * windowSizeMillis,
+                        windowSizeMillis, 0, 0, 0, 0));
+            }
+        }
+
+        private WindowSnapshot snapshotOfBucket(Bucket b) {
+            return new WindowSnapshot(dimension, b.windowIndex * windowSizeMillis,
+                    windowSizeMillis, b.count, b.errors, b.totalLatency,
+                    b.maxLatency);
         }
 
         synchronized void collectOpen(List<WindowSnapshot> out) {
